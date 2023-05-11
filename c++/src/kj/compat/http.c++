@@ -2443,10 +2443,20 @@ public:
       compressionContext.emplace(ZlibContext::Mode::COMPRESS, *config);
       decompressionContext.emplace(ZlibContext::Mode::DECOMPRESS, *config);
     }
+    KJ_DBG("Created websocket ", (void*)this, " with FD ", this->stream->getFd().orDefault(-1));
+    KJ_DBG("WebSocket stream ", (void*)this->stream.get());
 #else
     KJ_REQUIRE(compressionConfig == nullptr,
         "WebSocket compression is only supported if KJ is compiled with Zlib.");
 #endif // KJ_HAS_ZLIB
+  }
+
+  ~WebSocketImpl() {
+    KJ_DBG("DESTROYING WebSocketImpl ", (void*)this, " with FD ", stream->getFd().orDefault(-1), " and PID ", getpid());
+    KJ_DBG("WebSocket stream ", (void*)stream.get());
+    stream = nullptr;  // TODO: delete this line!
+    KJ_DBG("Finished destroying websocket");
+    // throw new kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__);
   }
 
   kj::Promise<void> send(kj::ArrayPtr<const byte> message) override {
@@ -2495,6 +2505,7 @@ public:
   }
 
   void abort() override {
+    KJ_DBG("WebSocket::abort()");
     queuedPong = nullptr;
     sendingPong = nullptr;
     disconnected = true;
@@ -2503,10 +2514,12 @@ public:
   }
 
   kj::Promise<void> whenAborted() override {
+    KJ_DBG("WebSocket::whenAborted()");
     return stream->whenWriteDisconnected();
   }
 
   kj::Promise<Message> receive(size_t maxSize) override {
+    KJ_DBG("Calling kj::WebSocketImpl::receive() with FD ", stream->getFd().orDefault(-1));
     size_t headerSize = Header::headerSize(recvData.begin(), recvData.size());
 
     if (headerSize > recvData.size()) {
@@ -2520,6 +2533,7 @@ public:
 
       return stream->tryRead(recvData.end(), 1, recvBuffer.end() - recvData.end())
           .then([this,maxSize](size_t actual) -> kj::Promise<Message> {
+        KJ_DBG(">>> WebSocket: WE GOT A READ RESULT");
         receivedBytes += actual;
         if (actual == 0) {
           if (recvData.size() > 0) {
@@ -2682,9 +2696,11 @@ public:
           }
         case OPCODE_PING:
           // Send back a pong.
+          KJ_DBG("GOT A PING > SENDING BACK A PONG.");
           queuePong(kj::mv(message));
           return receive(maxSize);
         case OPCODE_PONG:
+          KJ_DBG("GOT A PONG.");
           // Unsolicited pong. Ignore.
           return receive(maxSize);
         default:
@@ -3371,11 +3387,13 @@ private:
     return stream->pumpTo(*other.stream).then([this, &other](size_t s) -> kj::Promise<void> {
       // WebSocket pumps are expected to include end-of-stream.
       other.disconnected = true;
+      KJ_DBG("pumpTo disconnection");
       other.stream->shutdownWrite();
       receivedBytes += s;
       other.sentBytes += s;
       return kj::READY_NOW;
     }, [&other](kj::Exception&& e) -> kj::Promise<void> {
+      KJ_DBG("pumpTo threw an exception - shutting down write");
       // We don't know if it was a read or a write that threw. If it was a read that threw, we need
       // to send a disconnect on the destination. If it was the destination that threw, it
       // shouldn't hurt to disconnect() it again, but we'll catch and squelch any exceptions.
@@ -3391,6 +3409,7 @@ kj::Own<WebSocket> upgradeToWebSocket(
     kj::Maybe<EntropySource&> maskKeyGenerator,
     kj::Maybe<CompressionParameters> compressionConfig = nullptr) {
   // Create a WebSocket upgraded from an HTTP stream.
+  KJ_DBG("Upgrading to websocket - this seems to be the point where we take ownership of the stream/FD");
   auto releasedBuffer = httpInput.releaseBuffer();
   return kj::heap<WebSocketImpl>(kj::mv(stream), maskKeyGenerator,
                                  kj::mv(compressionConfig), kj::mv(releasedBuffer.buffer),
@@ -4128,6 +4147,10 @@ public:
     stream->shutdownWrite();
   }
 
+  virtual kj::Maybe<int> getFd() const override {
+    return stream->getFd();
+  }
+
   // AsyncInputStream
   Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     KJ_REQUIRE(maxBytes >= minBytes);
@@ -4254,6 +4277,11 @@ public:
         writeGuard(handleWriteGuard(kj::mv(writeGuard))),
         tasks(*this) {}
 
+  ~AsyncIoStreamWithGuards() {
+    KJ_DBG("~AsyncIoStreamWithGuards", (void*)this, "with FD ", inner->getFd().orDefault(-1));
+    // throw new kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str("LOL HI"));
+  }
+
   // AsyncInputStream
   Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     if (readGuardReleased) {
@@ -4332,6 +4360,11 @@ public:
         }
       });
     }
+  }
+
+  Maybe<int> getFd() const override {
+    KJ_DBG("AsyncIoStreamWithGuards::getFd()");
+    return inner->getFd();
   }
 
 private:
@@ -4949,7 +4982,18 @@ public:
       : httpInput(*rawStream, responseHeaderTable),
         httpOutput(*rawStream),
         ownStream(kj::mv(rawStream)),
-        settings(kj::mv(settings)) {}
+        settings(kj::mv(settings)) {
+          // ownStream is a PromisedAsyncIoStream that hasn't resolved its FD quite yet...
+        }
+
+  ~HttpClientImpl() {
+    // I think this is a PromisedAsyncIoStream.
+    if (ownStream.get()) {
+      KJ_DBG("~HttpClientImpl with FD", ownStream->getFd().orDefault(-1));
+    } else {
+      KJ_DBG("~HttpClientImpl with empty stream");
+    }
+  }
 
   bool canReuse() {
     // Returns true if we can immediately reuse this HttpClient for another message (so all
@@ -4968,6 +5012,8 @@ public:
     KJ_REQUIRE(httpOutput.canReuse(),
         "can't start new request until previous request body has been fully written");
     closeWatcherTask = nullptr;
+
+    KJ_DBG("HttpClientImpl::request()");
 
     kj::StringPtr connectionHeaders[HttpHeaders::CONNECTION_HEADERS_COUNT];
     kj::String lengthStr;
@@ -5172,6 +5218,7 @@ public:
               }
             }
 
+            KJ_DBG("Upgrade to websocket with FD ", ownStream->getFd().orDefault(-1));
             return {
               response.statusCode,
               response.statusText,
@@ -5280,6 +5327,7 @@ public:
       KJ_UNREACHABLE;
     }).split();
 
+    KJ_DBG("Making a connect request and moving the own stream into that!");
     return ConnectRequest {
       kj::mv(kj::get<0>(split)),  // Promise for the result
       heap<AsyncIoStreamWithGuards>(
@@ -5303,6 +5351,7 @@ private:
   // point in history.
 
   void watchForClose() {
+    KJ_DBG("HttpClientImpl::watchForClose()");
     closeWatcherTask = httpInput.awaitNextMessage()
         .then([this](bool hasData) -> kj::Promise<void> {
       if (hasData) {
@@ -5344,6 +5393,7 @@ kj::Promise<HttpClient::WebSocketResponse> HttpClient::openWebSocket(
     kj::StringPtr url, const HttpHeaders& headers) {
   return request(HttpMethod::GET, url, headers, nullptr)
       .response.then([](HttpClient::Response&& response) -> WebSocketResponse {
+    KJ_DBG("GOT HOLD OF A RESPONSE TO THE INITIAL WEBSOCKET REQUEST");
     kj::OneOf<kj::Own<kj::AsyncInputStream>, kj::Own<WebSocket>> body;
     body.init<kj::Own<kj::AsyncInputStream>>(kj::mv(response.body));
 
@@ -5396,6 +5446,10 @@ public:
         address(kj::mv(address)),
         settings(kj::mv(settings)) {}
 
+  ~NetworkAddressHttpClient() {
+    KJ_DBG("Destroying NetworkAddressHttpClient");
+  }
+
   bool isDrained() {
     // Returns true if there are no open connections.
     return activeConnectionCount == 0 && availableClients.empty();
@@ -5447,6 +5501,7 @@ public:
   ConnectRequest connect(
       kj::StringPtr host, const HttpHeaders& headers, HttpConnectSettings settings) override {
     auto refcounted = getClient();
+    KJ_DBG("Making NetworkAddressHttpClient::connect()");
     auto request = refcounted->client->connect(host, headers, settings);
     return ConnectRequest {
       request.status.attach(kj::addRef(*refcounted)),
@@ -5479,12 +5534,15 @@ private:
       ++parent.activeConnectionCount;
     }
     ~RefcountedClient() noexcept(false) {
+      KJ_DBG("Destroying RefcountedClient");
       --parent.activeConnectionCount;
       KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
         parent.returnClientToAvailable(kj::mv(client));
       })) {
         KJ_LOG(ERROR, *exception);
       }
+      client = nullptr;
+      KJ_DBG("Destroyed RefcountedClient");
     }
 
     NetworkAddressHttpClient& parent;
@@ -5494,7 +5552,9 @@ private:
   kj::Own<RefcountedClient> getClient() {
     for (;;) {
       if (availableClients.empty()) {
+        KJ_DBG("NetworkAddressHttpClient::getClient() - IMPORTANT - where we probs created FDs");
         auto stream = newPromisedStream(address->connect());
+        KJ_DBG("Stream FD is ", stream->getFd().orDefault(-1));
         return kj::refcounted<RefcountedClient>(*this,
           kj::heap<HttpClientImpl>(responseHeaderTable, kj::mv(stream), settings));
       } else {
@@ -5553,6 +5613,7 @@ class PromiseNetworkAddressHttpClient final: public HttpClient {
 public:
   PromiseNetworkAddressHttpClient(kj::Promise<kj::Own<NetworkAddressHttpClient>> promise)
       : promise(promise.then([this](kj::Own<NetworkAddressHttpClient>&& client) {
+          KJ_DBG("Resolved PromiseNetworkAddressHttpClient");
           this->client = kj::mv(client);
         }).fork()) {}
 
@@ -5655,6 +5716,7 @@ public:
 
   Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = nullptr) override {
+    KJ_DBG(">>> NetworkHttpClient::request");
     // We need to parse the proxy-style URL to convert it to host-style.
     // Use URL parsing options that avoid unnecessary rewrites.
     Url::Options urlOptions;
@@ -5831,6 +5893,7 @@ private:
 
 kj::Own<HttpClient> newHttpClient(kj::Timer& timer, const HttpHeaderTable& responseHeaderTable,
                                   kj::NetworkAddress& addr, HttpClientSettings settings) {
+  KJ_DBG("newHttpClient with network address");
   return kj::heap<NetworkAddressHttpClient>(timer, responseHeaderTable,
       kj::Own<kj::NetworkAddress>(&addr, kj::NullDisposer::instance), kj::mv(settings));
 }
@@ -6610,6 +6673,7 @@ public:
       HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) override {
     if (!headers.isWebSocket()) {
+      KJ_DBG(">>> I IZ NOT A WEBSOCKET REQUEST");
       auto innerReq = client.request(method, url, headers, requestBody.tryGetLength());
 
       auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
@@ -6627,8 +6691,10 @@ public:
 
       return kj::joinPromises(promises.finish());
     } else {
+      KJ_DBG(">>> I IZ A WEBSOCKET REQUEST");
       return client.openWebSocket(url, headers)
           .then([&response](HttpClient::WebSocketResponse&& innerResponse) -> kj::Promise<void> {
+        KJ_DBG("WE MANAGED TO ESTABLISH A WEBSOCKET!?");
         KJ_SWITCH_ONEOF(innerResponse.webSocketOrBody) {
           KJ_CASE_ONEOF(ws, kj::Own<WebSocket>) {
             auto ws2 = response.acceptWebSocket(*innerResponse.headers);
@@ -6657,6 +6723,7 @@ public:
                             HttpConnectSettings settings) override {
     KJ_REQUIRE(!headers.isWebSocket(), "WebSocket upgrade headers are not permitted in a connect.");
 
+    KJ_DBG("Starting CONNECT request from HttpServiceAdapter");
     auto request = client.connect(host, headers, settings);
 
     // This operates optimistically. In order to support pipelining, we connect the
@@ -6776,6 +6843,7 @@ public:
 public:
   kj::Promise<bool> startLoop(bool firstRequest) {
     return loop(firstRequest).catch_([this](kj::Exception&& e) -> kj::Promise<bool> {
+      KJ_DBG("EXCEPTION IN SERVER CONNECTION LOOP: ", e);
       // Exception; report 5xx.
 
       KJ_IF_MAYBE(p, webSocketError) {
@@ -6811,6 +6879,8 @@ public:
       suspendable.headers.cloneShallow(),
     };
   }
+
+  // TODO: implement a getFd() here for convenience?
 
 private:
   HttpServer& server;
@@ -7019,6 +7089,7 @@ private:
           auto service = KJ_ASSERT_NONNULL(kj::mv(maybeService),
               "SuspendableHttpServiceFactory did not suspend, but returned nullptr.");
           auto connectStream = getConnectStream();
+          KJ_DBG(">>> GOT A CONNECT REQUEST ON THE SERVER SIDE (I think)");
           auto promise = service->connect(
               request.authority, headers, *connectStream, *this, {})
               .attach(kj::mv(service), kj::mv(connectStream));
@@ -7037,11 +7108,17 @@ private:
 
             return httpOutput.flush().then([]() mutable -> kj::Promise<bool> {
               // There is really no reasonable path to reusing a CONNECT connection.
+              // TODO: yeah but... we need to keep the underlying TCP connection open
+              // at the very least so we can forward bytes to the proxy server...
+              // Otherwise we're just not implementing HTTP CONNECT right...
+              KJ_DBG("POST HTTP OUTPUT FLUSH");
               return false;
             });
           });
         }
         KJ_CASE_ONEOF(request, HttpHeaders::Request) {
+          KJ_DBG(">>> GOT AN HTTP REQUEST ON THE SERVER SIDE: URL: ", request.url, ", METHOD: ",
+              request.method);
           auto& headers = httpInput.getHeaders();
 
           currentMethod = request.method;
@@ -7067,10 +7144,12 @@ private:
           auto promise = service->request(
               request.method, request.url, headers, *body, *this).attach(kj::mv(service));
           return promise.then([this, body = kj::mv(body)]() mutable -> kj::Promise<bool> {
+            KJ_DBG("HTTP REQUEST DONE!");
             // Response done. Await next request.
 
             KJ_IF_MAYBE(p, webSocketError) {
               // sendWebSocketError() was called. Finish sending and close the connection.
+              KJ_DBG("WEBSOCKET ERROR!?");
               auto promise = kj::mv(*p);
               webSocketError = nullptr;
               return kj::mv(promise);
@@ -7532,6 +7611,7 @@ kj::Promise<void> HttpServer::listenHttp(kj::ConnectionReceiver& port) {
 }
 
 kj::Promise<void> HttpServer::listenLoop(kj::ConnectionReceiver& port) {
+  KJ_DBG("HTTPSERVER: LISTEN LOOP");
   return port.accept()
       .then([this,&port](kj::Own<kj::AsyncIoStream>&& connection) -> kj::Promise<void> {
     tasks.add(kj::evalNow([&]() { return listenHttp(kj::mv(connection)); }));
@@ -7576,7 +7656,10 @@ kj::Promise<bool> HttpServer::listenHttpImpl(kj::AsyncIoStream& connection, bool
     // meaning this factory function will outlive all Owns we return. So, it's safe to return a fake
     // Own.
     return kj::Own<HttpService>(srv.get(), kj::NullDisposer::instance);
-  }, nullptr /* suspendedRequest */, wantCleanDrain);
+  }, nullptr /* suspendedRequest */, wantCleanDrain).then([](bool wat) {
+    KJ_DBG(">>> listenHttpImpl returned: ", wat);
+    return wat;
+  });
 }
 
 kj::Promise<bool> HttpServer::listenHttpCleanDrain(kj::AsyncIoStream& connection,
@@ -7599,7 +7682,7 @@ kj::Promise<bool> HttpServer::listenHttpImpl(kj::AsyncIoStream& connection,
   // Start reading requests and responding to them, but immediately cancel processing if the client
   // disconnects.
   auto promise = obj->startLoop(true)
-      .exclusiveJoin(connection.whenWriteDisconnected().then([]() {return false;}));
+      .exclusiveJoin(connection.whenWriteDisconnected().then([]() { KJ_DBG("Write was disconnected."); return false;}));
 
   // Eagerly evaluate so that we drop the connection when the promise resolves, even if the caller
   // doesn't eagerly evaluate.

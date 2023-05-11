@@ -61,6 +61,7 @@ Promise<size_t> AsyncInputStream::read(void* buffer, size_t minBytes, size_t max
     if (result >= minBytes) {
       return result;
     } else {
+      KJ_DBG("AsyncInputStream disconnected prematurely!");
       kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "stream disconnected prematurely"));
       // Pretend we read zeros from the input.
       memset(reinterpret_cast<byte*>(buffer) + result, 0, minBytes - result);
@@ -2326,6 +2327,7 @@ class PromisedAsyncIoStream final: public kj::AsyncIoStream, private kj::TaskSet
 public:
   PromisedAsyncIoStream(kj::Promise<kj::Own<AsyncIoStream>> promise)
       : promise(promise.then([this](kj::Own<AsyncIoStream> result) {
+          KJ_DBG("PromisedAsyncIoStream stream resolved with FD ", result->getFd().orDefault(-1));
           stream = kj::mv(result);
         }).fork()),
         tasks(*this) {}
@@ -2344,6 +2346,7 @@ public:
       return s->get()->tryRead(buffer, minBytes, maxBytes);
     } else {
       return promise.addBranch().then([this,buffer,minBytes,maxBytes]() {
+        KJ_DBG("PromisedAsyncIoStream::tryRead from FD ", KJ_ASSERT_NONNULL(stream)->getFd().orDefault(-1));
         return KJ_ASSERT_NONNULL(stream)->tryRead(buffer, minBytes, maxBytes);
       });
     }
@@ -2439,6 +2442,7 @@ public:
   }
 
   kj::Maybe<int> getFd() const override {
+    KJ_DBG("calling PromisedAsyncIoStream::getFd()");
     KJ_IF_MAYBE(s, stream) {
       return s->get()->getFd();
     } else {
@@ -2742,6 +2746,7 @@ uint CapabilityStreamConnectionReceiver::getPort() {
 
 Promise<Own<AsyncIoStream>> CapabilityStreamNetworkAddress::connect() {
   CapabilityPipe pipe;
+  KJ_DBG("CapabilityStreamNetworkAddress::connect");
   KJ_IF_MAYBE(p, provider) {
     pipe = p->newCapabilityPipe();
   } else {

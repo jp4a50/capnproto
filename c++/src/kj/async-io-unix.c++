@@ -128,10 +128,12 @@ public:
   }
 
   ~OwnedFileDescriptor() noexcept(false) {
+    KJ_DBG("~OwnedFileDescriptor (closes) ", fd, ", has ownership? ", (bool)(flags & LowLevelAsyncIoProvider::TAKE_OWNERSHIP));
     // Don't use SYSCALL() here because close() should not be repeated on EINTR.
     if ((flags & LowLevelAsyncIoProvider::TAKE_OWNERSHIP) && close(fd) < 0) {
       KJ_FAIL_SYSCALL("close", errno, fd) {
         // Recoverable exceptions are safe in destructors.
+        KJ_DBG("Failed to close file descriptor with FD ", fd, ", errno: ", errno);
         break;
       }
     }
@@ -151,12 +153,31 @@ public:
   AsyncStreamFd(UnixEventPort& eventPort, int fd, uint flags, uint observerFlags)
       : OwnedFileDescriptor(fd, flags),
         eventPort(eventPort),
-        observer(eventPort, fd, observerFlags) {}
-  virtual ~AsyncStreamFd() noexcept(false) {}
+        observer(eventPort, fd, observerFlags) {
+        }
+
+  virtual ~AsyncStreamFd() noexcept(false) {
+    int domain;
+    int length = sizeof(int);
+    socklen_t socklen = length;
+    ::getsockopt(fd, SOL_SOCKET, SO_DOMAIN , &domain, &socklen);
+    KJ_DBG("~AsyncStreamFd ", (void*)this, "with FD ", fd, ", sock domain: ", domain);
+    KJ_DBG("AF_UNIX: ", AF_UNIX);
+  }
 
   Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    KJ_DBG(">>> tryRead()", fd);
+    if (fd == 19) {
+      KJ_DBG("tryRead() FD with stack: ", kj::getStackTrace());
+    }
+    if (fd == 19) {
+      KJ_DBG(">>> Async trace: ", kj::getAsyncTrace());
+    }
     return tryReadInternal(buffer, minBytes, maxBytes, nullptr, 0, {0,0})
-        .then([](ReadResult r) { return r.byteCount; });
+        .then([fd = this->fd](ReadResult r) {
+          KJ_DBG("Got a read result for fd ", fd, ": ", r.byteCount);
+          return r.byteCount;
+        });
   }
 
   Promise<ReadResult> tryReadWithFds(void* buffer, size_t minBytes, size_t maxBytes,
@@ -486,12 +507,14 @@ public:
   }
 
   void shutdownWrite() override {
+    KJ_DBG(">>> AsyncStreamFd::shutdownWrite()");
     // There's no legitimate way to get an AsyncStreamFd that isn't a socket through the
     // UnixAsyncIoProvider interface.
     KJ_SYSCALL(shutdown(fd, SHUT_WR));
   }
 
   void abortRead() override {
+    KJ_DBG(">>> AsyncStreamFd::abortRead()");
     // There's no legitimate way to get an AsyncStreamFd that isn't a socket through the
     // UnixAsyncIoProvider interface.
     KJ_SYSCALL(shutdown(fd, SHUT_RD));
@@ -520,6 +543,7 @@ public:
   }
 
   kj::Maybe<int> getFd() const override {
+    KJ_DBG("Calling AsyncStreamFd::getFd()");
     return fd;
   }
 
@@ -560,6 +584,7 @@ private:
   Promise<ReadResult> tryReadInternal(void* buffer, size_t minBytes, size_t maxBytes,
                                       AutoCloseFd* fdBuffer, size_t maxFds,
                                       ReadResult alreadyRead) {
+    KJ_DBG(">>> tryReadInternal() on FD ", fd);
     // `alreadyRead` is the number of bytes we have already received via previous reads -- minBytes,
     // maxBytes, and buffer have already been adjusted to account for them, but this count must
     // be included in the final return value.
@@ -722,6 +747,7 @@ private:
       });
     } else if (n == 0) {
       // EOF -OR- maxBytes == 0.
+      KJ_DBG("Got EOF on FD ", fd);
       return alreadyRead;
     } else if (implicitCast<size_t>(n) >= minBytes) {
       // We read enough to stop here.
@@ -1489,6 +1515,7 @@ public:
     return heap<AsyncStreamFd>(eventPort, fd, flags, UnixEventPort::FdObserver::OBSERVE_READ_WRITE);
   }
   Own<AsyncCapabilityStream> wrapUnixSocketFd(Fd fd, uint flags = 0) override {
+    KJ_DBG("wrapUnixSocketFd: ", fd);
     return heap<AsyncStreamFd>(eventPort, fd, flags, UnixEventPort::FdObserver::OBSERVE_READ_WRITE);
   }
   Promise<Own<AsyncIoStream>> wrapConnectingSocketFd(
@@ -1501,6 +1528,7 @@ public:
     // Unfortunately connect() doesn't fit the mold of KJ_NONBLOCKING_SYSCALL, since it indicates
     // non-blocking using EINPROGRESS.
     for (;;) {
+      KJ_DBG("Connecting to socket address: ", addr->sa_data, " using FD ", fd);
       if (::connect(fd, addr, addrlen) < 0) {
         int error = errno;
         if (error == EINPROGRESS) {
@@ -1525,6 +1553,7 @@ public:
       if (err != 0) {
         KJ_FAIL_SYSCALL("connect()", err) { break; }
       }
+      KJ_DBG("async-io-unix.c++: connected.then FD ", stream->getFd().orDefault(-1));
       return kj::mv(stream);
     });
   }
@@ -1651,17 +1680,20 @@ private:
         return KJ_EXCEPTION(FAILED, "connect() blocked by restrictPeers()");
       } else {
         int fd = addrs[0].socket(SOCK_STREAM);
+        KJ_DBG("Wrapping connecting socket FD: ", fd);
         return lowLevel.wrapConnectingSocketFd(
             fd, addrs[0].getRaw(), addrs[0].getRawSize(), NEW_FD_FLAGS);
       }
     }).then([&lowLevel,&filter,addrs,authenticated](Own<AsyncIoStream>&& stream)
         -> Promise<AuthenticatedStream> {
       // Success, pass along.
+      KJ_DBG("Taking wrapped socket FD stream with fd: ", stream->getFd().orDefault(-1));
       AuthenticatedStream result;
       result.stream = kj::mv(stream);
       if (authenticated) {
         result.peerIdentity = addrs[0].getIdentity(lowLevel, filter, *result.stream);
       }
+      // KJ_DBG("Turned it into an authenticated stream with FD: ", result.getFd().orDefault(-1));
       return kj::mv(result);
     }, [&lowLevel,&filter,addrs,authenticated](Exception&& exception) mutable
         -> Promise<AuthenticatedStream> {
@@ -2006,6 +2038,7 @@ public:
     type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
 #endif
     KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
+    KJ_DBG("Wrapping two unix socket FDs into capability pipe ", fds[0], fds[1]);
     return CapabilityPipe { {
       lowLevel.wrapUnixSocketFd(fds[0], NEW_FD_FLAGS),
       lowLevel.wrapUnixSocketFd(fds[1], NEW_FD_FLAGS)

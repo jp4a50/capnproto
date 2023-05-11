@@ -23,6 +23,7 @@
 
 #include "async.h"
 #include <kj/function.h>
+#include <kj/debug.h>
 #include <kj/thread.h>
 #include <kj/timer.h>
 
@@ -166,7 +167,9 @@ public:
   // be useful. You can't connect() to or listen() on these addresses, obviously, because they are
   // ephemeral addresses for a single connection.
 
-  virtual kj::Maybe<int> getFd() const { return nullptr; }
+  virtual kj::Maybe<int> getFd() const {
+    KJ_DBG("AsyncIoStream::getFd()");
+    return nullptr; }
   // Get the underlying Unix file descriptor, if any. Returns nullptr if this object actually
   // isn't wrapping a file descriptor.
 };

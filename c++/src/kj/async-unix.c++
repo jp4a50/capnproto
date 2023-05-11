@@ -490,6 +490,7 @@ void UnixEventPort::FdObserver::fire(short events) {
 
   if (events & (EPOLLHUP | EPOLLERR)) {
     KJ_IF_MAYBE(f, hupFulfiller) {
+      KJ_DBG("Got an EPOLLHUP or EPOLLERR on fd ", fd, ": ", events, ", EPOLLHUP is ", EPOLLHUP);
       f->get()->fulfill();
       hupFulfiller = nullptr;
     }
